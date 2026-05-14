@@ -25,7 +25,11 @@ struct ContentView: View {
                     }
 
                     if newValue > Float(motor.threshold) {
-                        tic.moveForward(motorNum: motor.motorNum, speed: Int32(motor.maxSpeed))
+                        if motor.shouldMoveForward {
+                            tic.moveForward(motorNum: motor.motorNum, speed: Int32(motor.maxSpeed))
+                        } else {
+                            tic.moveBackward(motorNum: motor.motorNum, speed: Int32(motor.maxSpeed))
+                        }
                     } else {
                         tic.stop(motorNum: motor.motorNum)
                     }
@@ -105,11 +109,12 @@ struct TitledSliderView: View {
     let title: String
     @Binding var value: Double
     var range: ClosedRange<Double> = 0...100
+    var step: Double
     var body: some View {
         VStack(spacing: 12) {
             Text("\(title): \(Int(value))")
                 .font(.headline)
-            Slider(value: $value, in: range)
+            Slider(value: $value, in: range,  step: step)
         }
         .padding()
     }

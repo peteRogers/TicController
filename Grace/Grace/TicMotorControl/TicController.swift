@@ -460,11 +460,12 @@ struct MotorControlSettings: Identifiable {
     var name: String
     var serialNumber: String
     var motorNum: Int
-    var accel: Double = 30_000_000
-    var deccel: Double = 30_000_000
-    var maxSpeed: Double = 100_000_000
+    var accel: Double = 100000
+    var deccel: Double = 100000
+    var maxSpeed: Double = 12000000
     var threshold: Double = 5
     var currentIndex: Double = 3
+    var shouldMoveForward: Bool = true
     var isEnergized: Bool = false
     var isChangingEnergizedState: Bool = false
 

@@ -31,23 +31,39 @@ struct ControlPanel: View {
             Text(motor.isEnergized ? "UI state: energized" : "UI state: deenergized")
                 .font(.caption)
                 .foregroundStyle(motor.isEnergized ? .green : .red)
+
+            Toggle(isOn: $motor.shouldMoveForward) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("motion direction")
+                        .font(.headline)
+
+                    Text(motor.shouldMoveForward ? "Forward motion" : "Backward motion")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
+            .padding(.vertical, 8)
             
             TitledSliderView(
                 title: "acceleration",
                 value: $motor.accel,
-                range: 200_000...320_000_00
+                range: 200_000...320_000_00,
+                step: 100000
             )
 
             TitledSliderView(
                 title: "decceleration",
                 value: $motor.deccel,
-                range: 200_000...320_000_00
+                range: 200_000...320_000_00,
+                step: 100000
             )
 
             TitledSliderView(
                 title: "max speed",
                 value: $motor.maxSpeed,
-                range: 0...900_000_000
+                range: 0...900_000_000,
+                step: 2000000
             )
             
             VStack(spacing: 12) {
@@ -73,7 +89,8 @@ struct ControlPanel: View {
             TitledSliderView(
                 title: "movement threshold",
                 value: $motor.threshold,
-                range: 0...100
+                range: 0...100,
+                step: 0.2
             ).padding()
 
 
