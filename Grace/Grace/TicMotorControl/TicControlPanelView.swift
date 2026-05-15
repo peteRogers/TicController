@@ -48,21 +48,21 @@ struct ControlPanel: View {
             TitledSliderView(
                 title: "acceleration",
                 value: $motor.accel,
-                range: 200_000...320_000_00,
-                step: 100000
+                range: 50_000...320_000_00,
+                step: 50000
             )
 
             TitledSliderView(
                 title: "decceleration",
                 value: $motor.deccel,
-                range: 200_000...320_000_00,
-                step: 100000
+                range: 50_000...320_000_00,
+                step: 50000
             )
 
             TitledSliderView(
                 title: "max speed",
                 value: $motor.maxSpeed,
-                range: 0...900_000_000,
+                range: 0...900_000_00,
                 step: 2000000
             )
             
