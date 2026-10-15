@@ -88,7 +88,7 @@ function buildPanel(motor) {
     motor.deccel = v;
     scheduleApply(panel);
   });
-  slider(box, "max speed", 0, 200_000_000, motor.maxSpeed, 2_000_000, (v) => {
+  slider(box, "max speed", 0, 300_000_000, motor.maxSpeed, 3_000_000, (v) => {
     motor.maxSpeed = v;
     panel.lastState = null; // resend velocity at the new speed
     scheduleApply(panel);
