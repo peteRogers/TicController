@@ -1,6 +1,20 @@
 //
 //  ticController.js
 //  p5 / browser port of Grace/TicMotorControl/TicController.swift
+//  Shared by p5TicControl and p5FaceTicControl; load it from each page with
+//  <script src="../shared/ticController.js">.
+//
+//  Comes with a ready-made UI, in one of two modes:
+//
+//    velocity: each motor runs while an activity value is above its threshold
+//      tic = new TicController({ mode: "velocity" });
+//      tic.createControls();   // in setup(): Add Tic button, status, panels
+//      tic.drive(activity);    // in draw(): activity = 0–100
+//
+//    position: each motor turns to an angle
+//      tic = new TicController({ mode: "position" });
+//      tic.createControls();
+//      tic.follow(x);          // in draw(): x = 0–1 across the range, or null
 //
 //  The Swift version shells out to `ticcmd`. Browsers can't run processes, so
 //  this talks to each Tic directly over its native USB interface using WebUSB,
@@ -17,6 +31,7 @@
 //  Units are identical to ticcmd:
 //    velocity / max speed: microsteps per 10,000 s
 //    accel / decel:        microsteps per 100 s^2
+//    position:             microsteps
 //    current:              mA (converted to the Tic's current-limit code)
 //
 
@@ -50,7 +65,17 @@ const TIC_CMD = {
   setMaxAccel: 0xea,
   setMaxDecel: 0xe9,
   setCurrentLimit: 0x91,
+  haltAndSetPosition: 0xec,
+  setStepMode: 0x94,
 };
+
+// Step mode code (index) -> microsteps per full step. The T500 only goes to
+// 1/8; the others go to at least 1/32.
+const TIC_STEP_MODES = [1, 2, 4, 8, 16, 32];
+
+// Position updates are sent at most this often per motor, so the USB queue
+// never backs up.
+const TIC_SEND_INTERVAL_MS = 50;
 
 // Current limit code -> mA for the Tic T500 (non-linear table).
 const TIC_T500_CURRENT_TABLE_MA = [
@@ -67,8 +92,9 @@ const TIC_CURRENT_UNITS_MA = {
 };
 
 class TicController {
-  constructor({ product = "T500", keepAliveMs = 500 } = {}) {
+  constructor({ product = "T500", mode = "velocity", keepAliveMs = 500 } = {}) {
     this.product = product;
+    this.mode = mode;
     this.keepAliveMs = keepAliveMs;
 
     this.motors = [];
@@ -193,8 +219,10 @@ class TicController {
     return true;
   }
 
-  // Equivalent of `ticcmd --energize`, `--exit-safe-start`, `--resume`
-  async resumeAndEnergize(motorNum) {
+  // Equivalent of `ticcmd --energize`, `--exit-safe-start`, `--resume`.
+  // Pass { keepAlive: true } for position control, where the Tic should keep
+  // holding its target even when no new position has been sent for a while.
+  async resumeAndEnergize(motorNum, { keepAlive = false } = {}) {
     const motor = this._motor(motorNum, "Could not energize");
     if (!motor) return false;
 
@@ -211,6 +239,7 @@ class TicController {
     }
 
     motor.isEnergized = true;
+    if (keepAlive) this._startKeepAlive(motorNum);
     this.lastMessage = `Motor ${motorNum} resumed and energized`;
     return true;
   }
@@ -221,6 +250,242 @@ class TicController {
     if (await this._runTicCommands(motorNum, [this._encodeCurrent(currentMA, motorNum)])) {
       this.lastMessage = `Current limit set to ${currentMA} mA`;
     }
+  }
+
+  // MARK: - Position control
+
+  // Equivalent of `ticcmd --position`. The Tic moves there itself using the
+  // max speed / accel / decel limits. Position is in microsteps.
+  async setTargetPosition(motorNum, position) {
+    const motor = this._motor(motorNum, "Could not move");
+    if (!motor) return false;
+
+    const target = Math.round(position);
+    const ok = await this._runTicCommands(
+      motorNum,
+      [encode32(TIC_CMD.setTargetPosition, target)],
+      { showAsLastMessage: false }
+    );
+    if (ok) {
+      motor.targetPosition = target;
+      this.lastMessage = `Target position ${target}`;
+    }
+    return ok;
+  }
+
+  // Equivalent of `ticcmd --halt-and-set-position`: stops the motor and
+  // tells the Tic that wherever it is now counts as `position`. The Tic
+  // starts at 0 on power-up, so use this to define your 0° point.
+  async haltAndSetPosition(motorNum, position = 0) {
+    const motor = this._motor(motorNum, "Could not set position of");
+    if (!motor) return false;
+
+    const ok = await this._runTicCommands(motorNum, [
+      encode32(TIC_CMD.haltAndSetPosition, position),
+    ]);
+    if (ok) {
+      motor.targetPosition = Math.round(position);
+      this.lastMessage = `Motor ${motorNum} position set to ${Math.round(position)}`;
+    }
+    return ok;
+  }
+
+  // Equivalent of `ticcmd --step-mode`. `modeIndex` indexes TIC_STEP_MODES
+  // (0 = full step, 1 = 1/2, 2 = 1/4, ...).
+  setStepMode(motorNum, modeIndex) {
+    return this._runTicCommands(motorNum, [
+      { request: TIC_CMD.setStepMode, value: modeIndex, index: 0 },
+    ]);
+  }
+
+  // MARK: - Driving from draw()
+
+  // Velocity mode. Call every frame from draw(). Each energized motor runs at
+  // its max speed while `activity` (0–100) is above its threshold, and stops
+  // otherwise.
+  drive(activity) {
+    for (const motor of this.motors) this._driveMotor(motor, activity);
+  }
+
+  // Only sends a command when the state changes, not every frame.
+  _driveMotor(motor, activity) {
+    if (!motor.panel || !motor.isEnergized || motor.isChangingEnergizedState) return;
+
+    const direction = motor.shouldMoveForward ? 1 : -1;
+    const state = activity > motor.threshold ? direction : 0;
+    if (state === motor.lastState) return;
+    motor.lastState = state;
+
+    if (state === 0) this.stop(motor.motorNum);
+    else if (state > 0) this.moveForward(motor.motorNum, motor.maxSpeed);
+    else this.moveBackward(motor.motorNum, motor.maxSpeed);
+  }
+
+  // Position mode. Call every frame from draw(). `x` runs 0–1 across each
+  // motor's min–max angle; pass null when there's nothing to follow and the
+  // motor either holds still or returns to its home angle.
+  follow(x) {
+    for (const motor of this.motors) this._followTarget(motor, x);
+  }
+
+  // Only sends when the target actually changes, and rate-limited.
+  _followTarget(motor, x) {
+    if (!motor.panel || !motor.isEnergized || motor.isChangingEnergizedState) return;
+    const hasTarget = x !== null && x !== undefined;
+    if (!hasTarget && !motor.returnHome) return; // hold last position
+
+    if (hasTarget) {
+      const t = Math.min(Math.max(motor.invert ? 1 - x : x, 0), 1);
+      motor.angle = motor.minAngle + (motor.maxAngle - motor.minAngle) * t;
+    } else {
+      motor.angle = motor.homeAngle;
+    }
+
+    const target = Math.round((motor.angle / 360) * motor.microstepsPerRev);
+    if (Math.abs(target - motor.targetPosition) < motor.deadband) return;
+    if (motor.isSending || performance.now() - motor.lastSend < TIC_SEND_INTERVAL_MS) return;
+
+    motor.isSending = true;
+    motor.lastSend = performance.now();
+    this.setTargetPosition(motor.motorNum, target).finally(() => (motor.isSending = false));
+  }
+
+  // MARK: - Control panels (uses p5's DOM functions, so call from setup())
+
+  // Adds the Add Tic button, a status line and one panel per Tic, reconnects
+  // any Tics this page was already allowed to use, and de-energizes them all
+  // when the page closes.
+  createControls() {
+    addTicStyles();
+
+    const bar = createDiv().class("tic-bar");
+    const add = createButton("Add Tic…").parent(bar);
+    add.mousePressed(async () => {
+      const motor = await this.addTic(); // needs a user gesture
+      if (motor) this._buildPanel(motor);
+    });
+    const status = createSpan().class("tic-caption").parent(bar);
+    const error = createDiv().class("tic-error");
+
+    this.scanForTics().then((motors) => motors.forEach((m) => this._buildPanel(m)));
+    window.addEventListener("beforeunload", () => this.disconnectAll());
+
+    setInterval(() => {
+      status.html(` ${this.ticListMessage} · ${this.lastMessage}`);
+      error.html(this.lastError);
+      for (const motor of this.motors) motor.panel?.refresh();
+    }, 100);
+  }
+
+  _buildPanel(motor) {
+    if (motor.panel) return;
+    const isPosition = this.mode === "position";
+
+    if (isPosition) {
+      // Position mode wants faster limits than the velocity defaults.
+      motor.maxSpeed = 4_000_000;
+      motor.accel = 1_000_000;
+      motor.deccel = 1_000_000;
+    }
+
+    // Debounced like ControlPanel.scheduleApplyToTic (250 ms)
+    let applyTimer = null;
+    const scheduleApply = () => {
+      clearTimeout(applyTimer);
+      applyTimer = setTimeout(() => this._applySettings(motor), 250);
+    };
+    const degrees = (v) => `${v}°`;
+
+    const box = createDiv().class("tic-panel");
+    createElement("h3", motor.name).parent(box);
+    const stateLabel = createDiv().class("tic-caption").parent(box);
+    const angleLabel = isPosition ? createDiv().class("tic-caption").parent(box) : null;
+
+    if (isPosition) {
+      ticCheckbox(box, "invert direction", motor.invert, (v) => (motor.invert = v));
+      ticCheckbox(box, "go to home angle when nothing to follow", motor.returnHome, (v) => (motor.returnHome = v));
+
+      ticSlider(box, "min angle", 0, 360, motor.minAngle, 1, (v) => (motor.minAngle = v), degrees);
+      ticSlider(box, "max angle", 0, 360, motor.maxAngle, 1, (v) => (motor.maxAngle = v), degrees);
+      ticSlider(box, "home angle", 0, 360, motor.homeAngle, 1, (v) => (motor.homeAngle = v), degrees);
+
+      ticSlider(box, "motor steps / rev", 24, 400, motor.stepsPerRev, 1, (v) => (motor.stepsPerRev = v));
+      ticSlider(box, "step mode", 0, TIC_STEP_MODES.length - 1, motor.stepModeIndex, 1, (v) => {
+        motor.stepModeIndex = v;
+        scheduleApply();
+      }, (v) => (v === 0 ? "full step" : `1/${TIC_STEP_MODES[v]} step`));
+      ticSlider(box, "gear ratio", 1, 20, motor.gearRatio, 0.1, (v) => (motor.gearRatio = v), (v) => `${v}:1`);
+    } else {
+      ticCheckbox(box, "forward motion", motor.shouldMoveForward, (v) => (motor.shouldMoveForward = v));
+    }
+
+    ticSlider(box, "acceleration", 50_000, 32_000_000, motor.accel, 50_000, (v) => {
+      motor.accel = v;
+      scheduleApply();
+    });
+    ticSlider(box, "deceleration", 50_000, 32_000_000, motor.deccel, 50_000, (v) => {
+      motor.deccel = v;
+      scheduleApply();
+    });
+    const speedMax = isPosition ? 100_000_000 : 90_000_000;
+    const speedStep = isPosition ? 200_000 : 2_000_000;
+    ticSlider(box, "max speed", 0, speedMax, motor.maxSpeed, speedStep, (v) => {
+      motor.maxSpeed = v;
+      motor.lastState = null; // velocity mode: resend at the new speed
+      scheduleApply();
+    });
+    const maxIndex = motor.supportedCurrentLimitsMA.length - 1;
+    ticSlider(box, "current limit", 0, maxIndex, motor.currentIndex, 1, (v) => {
+      motor.currentIndex = v;
+      scheduleApply();
+    }, () => `${motor.selectedCurrentLimitMA} mA`);
+
+    const energize = createButton("Energize").parent(box);
+    energize.mousePressed(async () => {
+      motor.isChangingEnergizedState = true;
+      if (motor.isEnergized) {
+        await this.deenergize(motor.motorNum);
+      } else {
+        await this._applySettings(motor);
+        // Position mode keeps the Tic holding its target between updates.
+        await this.resumeAndEnergize(motor.motorNum, { keepAlive: isPosition });
+      }
+      motor.lastState = 0;
+      motor.isChangingEnergizedState = false;
+    });
+
+    if (isPosition) {
+      // Declare the motor's current physical position as 0°.
+      const zero = createButton("Set 0° here").parent(box);
+      zero.mousePressed(() => this.haltAndSetPosition(motor.motorNum, 0));
+    } else {
+      ticSlider(box, "movement threshold", 0, 100, motor.threshold, 0.2, (v) => (motor.threshold = v));
+    }
+
+    motor.panel = {
+      remove: () => box.remove(),
+      refresh: () => {
+        stateLabel.html(motor.isEnergized ? "energized" : "deenergized");
+        stateLabel.style("color", motor.isEnergized ? "#6f6" : "#f66");
+        angleLabel?.html(`angle: ${motor.angle.toFixed(1)}°  target: ${motor.targetPosition} µsteps`);
+        energize.html(
+          motor.isChangingEnergizedState ? "Working..." : motor.isEnergized ? "Deenergize" : "Energize"
+        );
+        energize.elt.disabled = motor.isChangingEnergizedState;
+      },
+    };
+    motor.panel.refresh();
+  }
+
+  async _applySettings(motor) {
+    // Velocity mode leaves the step mode as configured in the Tic.
+    if (this.mode === "position") await this.setStepMode(motor.motorNum, motor.stepModeIndex);
+    return this.setMotionLimits(motor.motorNum, {
+      maxSpeed: motor.maxSpeed,
+      maxAccel: motor.accel,
+      maxDecel: motor.deccel,
+      current: motor.selectedCurrentLimitMA,
+    });
   }
 
   // MARK: - Main movement
@@ -319,6 +584,7 @@ class TicController {
     const motor = this.motors.find((m) => m.device === device);
     if (!motor) return;
     clearInterval(motor.keepAliveTimer);
+    motor.panel?.remove();
     this.motors = this.motors.filter((m) => m !== motor);
     this.motors.forEach((m, i) => (m.motorNum = i));
     this.lastError = `${motor.name} disconnected`;
@@ -434,6 +700,50 @@ function hex4(n) {
   return (n ?? 0).toString(16).padStart(4, "0");
 }
 
+// MARK: - Panel widgets
+
+// Default look for the controls. Added first in <head> so a page's own
+// stylesheet can override any of it.
+function addTicStyles() {
+  if (document.getElementById("tic-styles")) return;
+  const style = document.createElement("style");
+  style.id = "tic-styles";
+  style.textContent = `
+    .tic-bar { margin: 8px 16px 0; font-family: system-ui, sans-serif; }
+    .tic-error { margin: 4px 16px; color: #f88; font: 13px system-ui, sans-serif; white-space: pre-wrap; }
+    .tic-panel {
+      display: inline-block; vertical-align: top; width: 320px; margin: 16px;
+      padding: 16px; border-radius: 18px; background: rgba(40, 90, 200, 0.6);
+      color: #eee; font-family: system-ui, sans-serif;
+    }
+    .tic-panel h3 { margin: 0 0 4px; font-size: 15px; }
+    .tic-caption { font-size: 12px; margin-bottom: 8px; }
+    .tic-row { display: flex; flex-direction: column; margin: 10px 0; font-size: 13px; }
+    .tic-row input { width: 100%; }
+    .tic-bar button, .tic-panel button { margin-top: 8px; margin-right: 6px; }
+  `;
+  document.head.prepend(style);
+}
+
+function ticSlider(parent, title, min, max, value, step, onInput, format = (v) => v.toLocaleString()) {
+  const row = createDiv().class("tic-row").parent(parent);
+  const label = createSpan().parent(row);
+  const s = createSlider(min, max, value, step).parent(row);
+  const show = () => label.html(`${title}: ${format(s.value())}`);
+  s.input(() => {
+    onInput(s.value());
+    show();
+  });
+  show();
+  return s;
+}
+
+function ticCheckbox(parent, title, value, onChange) {
+  const c = createCheckbox(` ${title}`, value).parent(parent);
+  c.changed(() => onChange(c.checked()));
+  return c;
+}
+
 // MARK: - Data structs
 
 class MotorControlSettings {
@@ -448,6 +758,23 @@ class MotorControlSettings {
     this.shouldMoveForward = true;
     this.isEnergized = false;
     this.isChangingEnergizedState = false;
+    this.targetPosition = 0;
+
+    // Position following (see TicController.follow)
+    this.stepsPerRev = 200;
+    this.stepModeIndex = 0;
+    this.gearRatio = 1;
+    this.minAngle = 0;
+    this.maxAngle = 180;
+    this.homeAngle = 90;
+    this.invert = false;
+    this.returnHome = false;
+    this.deadband = 1; // microsteps
+    this.angle = 0;
+    this.lastSend = 0;
+    this.isSending = false;
+    this.lastState = 0; // velocity mode: -1 back, 0 stopped, 1 forward
+    this.panel = null;
 
     this.supportedCurrentLimitsMA = [
       343, 445, 506, 634, 762, 880, 1007, 1115, 1241, 1352, 1500,
@@ -463,6 +790,10 @@ class MotorControlSettings {
   get selectedCurrentLimitMA() {
     const i = clampIndex(this.currentIndex, this.supportedCurrentLimitsMA);
     return this.supportedCurrentLimitsMA[i];
+  }
+
+  get microstepsPerRev() {
+    return this.stepsPerRev * TIC_STEP_MODES[this.stepModeIndex] * this.gearRatio;
   }
 }
 
