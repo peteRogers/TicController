@@ -24,7 +24,12 @@ function setup() {
   video.size(VIDEO_W, VIDEO_H);
   video.hide();
 
-  faceMesh = ml5.faceMesh({ maxFaces: 1, refineLandmarks: false, flipped: true }, () => {
+  // With p5 2.x, ml5.faceMesh() returns a Promise of the model rather than the
+  // model itself, so start detecting once it resolves.
+  // No `flipped` option here: ml5 already mirrors its results to match the
+  // flipped capture, and asking it to flip again puts the box on the wrong side.
+  ml5.faceMesh({ maxFaces: 1, refineLandmarks: false }).then((model) => {
+    faceMesh = model;
     modelReady = true;
     faceMesh.detectStart(video, (results) => (faces = results));
   });
@@ -36,8 +41,7 @@ function setup() {
 function draw() {
   image(video, 0, 0, VIDEO_W, VIDEO_H);
 
-  const hasFace = faces.length > 0;
-  if (hasFace) {
+  if (faces.length > 0) {
     const box = faces[0].box;
     const centre = (box.xMin + box.width / 2) / VIDEO_W;
     faceX = lerp(faceX, constrain(centre, 0, 1), 0.3);
@@ -50,11 +54,7 @@ function draw() {
 
   stroke(80, 160, 255);
   line(faceX * VIDEO_W, 0, faceX * VIDEO_W, VIDEO_H);
+  tic.follow(faces.length > 0 ? faceX : null);
 
-  noStroke();
-  fill(240);
-  textSize(13);
-  text(modelReady ? (hasFace ? "face found" : "no face") : "loading face model...", 12, 20);
-
-  tic.follow(hasFace ? faceX : null);
+ 
 }

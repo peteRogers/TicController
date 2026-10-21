@@ -16,6 +16,10 @@
 //      tic.createControls();
 //      tic.follow(x);          // in draw(): x = 0–1 across the range, or null
 //
+//    While no Tic is connected, a preview panel shows the controls for a
+//    simulated motor (nothing is sent over USB). Its settings carry over to
+//    the first real Tic. Turn it off with tic.createControls({ preview: false }).
+//
 //  The Swift version shells out to `ticcmd`. Browsers can't run processes, so
 //  this talks to each Tic directly over its native USB interface using WebUSB,
 //  sending the same vendor control transfers that ticcmd sends via libusb.
@@ -355,19 +359,23 @@ class TicController {
   // Adds the Add Tic button, a status line and one panel per Tic, reconnects
   // any Tics this page was already allowed to use, and de-energizes them all
   // when the page closes.
-  createControls() {
+  createControls({ preview = true } = {}) {
     addTicStyles();
+    this.showPreview = preview;
 
     const bar = createDiv().class("tic-bar");
     const add = createButton("Add Tic…").parent(bar);
     add.mousePressed(async () => {
       const motor = await this.addTic(); // needs a user gesture
-      if (motor) this._buildPanel(motor);
+      if (motor) this._connectPanel(motor);
     });
     const status = createSpan().class("tic-caption").parent(bar);
     const error = createDiv().class("tic-error");
 
-    this.scanForTics().then((motors) => motors.forEach((m) => this._buildPanel(m)));
+    this.scanForTics().then((motors) => {
+      motors.forEach((m) => this._connectPanel(m));
+      this._updatePreview();
+    });
     window.addEventListener("beforeunload", () => this.disconnectAll());
 
     setInterval(() => {
@@ -377,16 +385,64 @@ class TicController {
     }, 100);
   }
 
+  // MARK: - Preview motor
+
+  // Shows the preview panel when no real Tic is connected, and removes it
+  // once one is.
+  _updatePreview() {
+    const preview = this.motors.find((m) => m.isPreview);
+    const hasRealTic = this.motors.some((m) => !m.isPreview);
+
+    if (preview && hasRealTic) {
+      this._stopKeepAlive(preview.motorNum);
+      preview.panel.remove();
+      this._removeMotor(preview);
+    } else if (!preview && !hasRealTic && this.showPreview) {
+      const motor = new MotorControlSettings({
+        name: "Preview (no Tic connected)",
+        motorNum: this.motors.length,
+      });
+      motor.isPreview = true;
+      motor.product = this.product;
+      motor.queue = Promise.resolve();
+      this._applyModeDefaults(motor);
+      this.motors.push(motor);
+      this._buildPanel(motor);
+    }
+  }
+
+  // Builds the panel for a newly connected Tic, starting from the preview's
+  // settings if there was one.
+  _connectPanel(motor) {
+    const preview = this.motors.find((m) => m.isPreview);
+    if (motor.panel) return;
+    if (preview) {
+      for (const key of MOTOR_SETTING_KEYS) motor[key] = preview[key];
+    } else {
+      this._applyModeDefaults(motor);
+    }
+    this._buildPanel(motor);
+    this._updatePreview();
+  }
+
+  _applyModeDefaults(motor) {
+    if (this.mode === "position") {
+      // Position mode wants faster limits than the velocity defaults: about
+      // 1 s for a 180° sweep with the default 5.1:1 gearbox at 1/8 step.
+      motor.maxSpeed = 40_000_000;
+      motor.accel = 2_000_000;
+      motor.deccel = 2_000_000;
+    }
+  }
+
+  _removeMotor(motor) {
+    this.motors = this.motors.filter((m) => m !== motor);
+    this.motors.forEach((m, i) => (m.motorNum = i));
+  }
+
   _buildPanel(motor) {
     if (motor.panel) return;
     const isPosition = this.mode === "position";
-
-    if (isPosition) {
-      // Position mode wants faster limits than the velocity defaults.
-      motor.maxSpeed = 4_000_000;
-      motor.accel = 1_000_000;
-      motor.deccel = 1_000_000;
-    }
 
     // Debounced like ControlPanel.scheduleApplyToTic (250 ms)
     let applyTimer = null;
@@ -515,6 +571,7 @@ class TicController {
   async disconnectAll() {
     for (const motor of this.motors) {
       this._stopKeepAlive(motor.motorNum);
+      if (motor.isPreview) continue;
       try {
         await this._send(motor, quick(TIC_CMD.deenergize));
         await motor.device.close();
@@ -585,17 +642,16 @@ class TicController {
     if (!motor) return;
     clearInterval(motor.keepAliveTimer);
     motor.panel?.remove();
-    this.motors = this.motors.filter((m) => m !== motor);
-    this.motors.forEach((m, i) => (m.motorNum = i));
+    this._removeMotor(motor);
     this.lastError = `${motor.name} disconnected`;
     this._updateListMessage();
+    if (this.showPreview) this._updatePreview();
   }
 
   _updateListMessage() {
+    const count = this.motors.filter((m) => !m.isPreview).length;
     this.ticListMessage =
-      this.motors.length === 0
-        ? "No Tic controllers found"
-        : `Found ${this.motors.length} Tic controller(s)`;
+      count === 0 ? "No Tic controllers found" : `Found ${count} Tic controller(s)`;
   }
 
   _motor(motorNum, action) {
@@ -625,7 +681,9 @@ class TicController {
 
     try {
       for (const command of commands) await this._send(motor, command);
-      if (showAsLastMessage) this.lastMessage = "Tic command sent";
+      if (showAsLastMessage) {
+        this.lastMessage = motor.isPreview ? "Preview only, nothing sent" : "Tic command sent";
+      }
       return true;
     } catch (err) {
       this.lastError = `Tic write failed.\nCommand: ${this.lastCommand}\nError: ${err.message}`;
@@ -634,6 +692,7 @@ class TicController {
   }
 
   _send(motor, { request, value, index }) {
+    if (motor.isPreview) return Promise.resolve(); // no USB device to send to
     const job = motor.queue.then(async () => {
       const result = await motor.device.controlTransferOut({
         requestType: "vendor",
@@ -746,6 +805,13 @@ function ticCheckbox(parent, title, value, onChange) {
 
 // MARK: - Data structs
 
+// The panel settings carried over from the preview motor to a real Tic.
+const MOTOR_SETTING_KEYS = [
+  "accel", "deccel", "maxSpeed", "currentIndex", "threshold", "shouldMoveForward",
+  "stepsPerRev", "stepModeIndex", "gearRatio", "minAngle", "maxAngle", "homeAngle",
+  "invert", "returnHome", "deadband",
+];
+
 class MotorControlSettings {
   constructor({ name, motorNum }) {
     this.name = name;
@@ -761,9 +827,10 @@ class MotorControlSettings {
     this.targetPosition = 0;
 
     // Position following (see TicController.follow)
+    // Defaults match our motor: 200 steps/rev, 5.1:1 gearbox, run at 1/8 step.
     this.stepsPerRev = 200;
-    this.stepModeIndex = 0;
-    this.gearRatio = 1;
+    this.stepModeIndex = 3; // index into TIC_STEP_MODES: 1/8 step
+    this.gearRatio = 5.1;
     this.minAngle = 0;
     this.maxAngle = 180;
     this.homeAngle = 90;
@@ -774,6 +841,7 @@ class MotorControlSettings {
     this.lastSend = 0;
     this.isSending = false;
     this.lastState = 0; // velocity mode: -1 back, 0 stopped, 1 forward
+    this.isPreview = false; // simulated motor shown while no Tic is connected
     this.panel = null;
 
     this.supportedCurrentLimitsMA = [
