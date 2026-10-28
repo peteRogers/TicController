@@ -1,7 +1,7 @@
 //
 //  ticController.js
 //  p5 / browser port of Grace/TicMotorControl/TicController.swift
-//  Shared by p5TicControl and p5FaceTicControl; load it from each page with
+//  Shared by the p5 sketches in this repo; load it from each page with
 //  <script src="../shared/ticController.js">.
 //
 //  Comes with a ready-made UI, in one of two modes:
@@ -71,7 +71,35 @@ const TIC_CMD = {
   setCurrentLimit: 0x91,
   haltAndSetPosition: 0xec,
   setStepMode: 0x94,
+  getVariable: 0xa1,
 };
+
+// Offsets into the Tic's variables (Tic user's guide, "Variable reference").
+// Everything up to TIC_VARIABLES_READ_SIZE is read in one transfer.
+const TIC_VAR = {
+  operationState: 0x00, // u8
+  errorStatus: 0x02, // u16 bit field, see TIC_ERRORS
+  targetPosition: 0x0a, // i32, microsteps
+  currentPosition: 0x22, // i32, microsteps
+  currentVelocity: 0x26, // i32, microsteps per 10,000 s
+};
+const TIC_VARIABLES_READ_SIZE = 0x2a;
+
+const TIC_OPERATION_STATES = {
+  0: "reset",
+  2: "deenergized",
+  4: "soft error",
+  6: "waiting for ERR line",
+  8: "starting up",
+  10: "normal",
+};
+
+// Error status bit -> name
+const TIC_ERRORS = [
+  "intentionally deenergized", "motor driver error", "low VIN", "kill switch active",
+  "required input invalid", "serial error", "command timeout", "safe start violation",
+  "ERR line high",
+];
 
 // Step mode code (index) -> microsteps per full step. The T500 only goes to
 // 1/8; the others go to at least 1/32.
@@ -292,6 +320,32 @@ class TicController {
       this.lastMessage = `Motor ${motorNum} position set to ${Math.round(position)}`;
     }
     return ok;
+  }
+
+  // Equivalent of `ticcmd --status`, cut down to the motion variables:
+  // { operationState, errors, targetPosition, currentPosition, currentVelocity }
+  // currentPosition is where the motor actually is, in microsteps. Returns
+  // null on failure (or for the preview motor, which has nothing to read).
+  async getStatus(motorNum) {
+    const motor = this._motor(motorNum, "Could not read status of");
+    if (!motor || motor.isPreview) return null;
+
+    try {
+      const data = await this._readVariables(motor, TIC_VARIABLES_READ_SIZE);
+      const errorBits = data.getUint16(TIC_VAR.errorStatus, true);
+      const state = data.getUint8(TIC_VAR.operationState);
+      return {
+        operationState: TIC_OPERATION_STATES[state] ?? `unknown (${state})`,
+        errors: TIC_ERRORS.filter((_, bit) => errorBits & (1 << bit)),
+        targetPosition: data.getInt32(TIC_VAR.targetPosition, true),
+        currentPosition: data.getInt32(TIC_VAR.currentPosition, true),
+        currentVelocity: data.getInt32(TIC_VAR.currentVelocity, true),
+      };
+    } catch (err) {
+      console.error("Tic read failed", err);
+      this.lastError = `Tic read failed: ${err.name}: ${err.message}`;
+      return null;
+    }
   }
 
   // Equivalent of `ticcmd --step-mode`. `modeIndex` indexes TIC_STEP_MODES
@@ -702,6 +756,24 @@ class TicController {
         index,
       });
       if (result.status !== "ok") throw new Error(`USB transfer ${result.status}`);
+    });
+    motor.queue = job.catch(() => {});
+    return job;
+  }
+
+  // Reads `length` bytes of variables from offset 0. Same queue as _send, so
+  // a read never overtakes a pending command.
+  _readVariables(motor, length) {
+    const job = motor.queue.then(async () => {
+      const result = await motor.device.controlTransferIn(
+        { requestType: "vendor", recipient: "device", request: TIC_CMD.getVariable, value: 0, index: 0 },
+        length
+      );
+      if (result.status !== "ok") throw new Error(`USB transfer ${result.status}`);
+      if (result.data.byteLength < length) {
+        throw new Error(`expected ${length} bytes, got ${result.data.byteLength}`);
+      }
+      return result.data;
     });
     motor.queue = job.catch(() => {});
     return job;
